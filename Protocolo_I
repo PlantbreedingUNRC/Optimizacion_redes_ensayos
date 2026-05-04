@@ -1,0 +1,487 @@
+/* ==========================================================
+   PROTOCOLO A. OPTIMIZACIÓN DE REPETICIONES
+   PASO 1: ORDENAMIENTO DE DATOS BASE
+   ========================================================== */
+proc sort data=WORK.IMPORT out=DATOS_LIMP;
+    by Subregion Loc Manejo Epoca Anio;
+run;
+
+/* ==========================================================
+   PASO 2: ESTIMACIÓN DE VARIANZAS (Genotipo x Año)
+   ========================================================== */
+/* PASO 2.1: Estimación y Generación de Residuos */
+proc mixed data=DATOS_LIMP method=reml nobound;
+    class Anio Cultivar;
+    model Rto = / outpred=RESIDUOS_NR;
+    random Cultivar;
+    by Subregion Loc Manejo Epoca Anio;
+    ods output CovParms=Var_Salida_Nr;
+run;
+
+/* PASO 2.2: VERIFICACIÓN DE SUPUESTOS (INICIAL)  */ 
+/* Ordenamos la tabla de residuos para que UNIVARIATE no se queje */
+proc sort data=RESIDUOS_NR;
+    by Subregion Loc Manejo Epoca Anio; 
+run;
+
+/* A. Normalidad (Shapiro-Wilk) */
+proc univariate data=RESIDUOS_NR normal noprint;
+    by Subregion Loc Manejo Epoca Anio;
+    var resid;
+    output out=Supuestos_Norm_NR normal=p_shapiro; 
+run;
+
+/* B. Homocedasticidad (Detección de Alta Variabilidad) */
+data RESID_PREP_NR;
+    set RESIDUOS_NR;
+    abs_resid = abs(resid); 
+run;
+
+proc means data=RESID_PREP_NR noprint nway;
+    class Subregion Manejo Epoca Loc Anio;
+    var abs_resid;
+    output out=Desviacion_NR std(abs_resid)=DS_resid;
+run;
+
+/* C. Ver resumen de Normalidad (¿Cuántos ensayos son normales?) */
+data Check_Norm_Final;
+    set Supuestos_Norm_NR;
+    if p_shapiro >= 0.05 then Estado = "Normal";
+    else Estado = "Revisar";
+run;
+
+proc freq data=Check_Norm_Final;
+    tables Estado;
+    title "Resumen de cumplimiento de Normalidad en la Red (Nr)";
+run;
+
+/* D. Ver la tabla de Homogeneidad (Detección de Alta Variabilidad) */
+/* Calculamos un umbral basado en la mediana de los desvíos para detectar outliers */
+proc sql;
+    create table Alert_Homog_View as
+    select *, 
+           case when DS_resid > (select median(DS_resid)*3 from Desviacion_NR) 
+           then 'ALTA VARIABILIDAD' else 'Normal' end as Estado_Varianza
+    from Desviacion_NR
+    where calculated Estado_Varianza = 'ALTA VARIABILIDAD';
+quit;
+
+proc print data=Alert_Homog_View;
+    title "Ensayos con posible Heterocedasticidad (Varianza Inestable)";
+run;
+
+
+/* ==========================================================
+   PASO 3: TRANSPOSICIÓN DE VARIANZAS
+   ========================================================== */
+data Var_Pre_Trans;
+    set Var_Salida_Nr;
+    length Efecto $10;
+    /* Limpiamos el nombre para que SAS no se confunda con espacios */
+    Comp = upcase(compress(CovParm));
+    
+    if Comp = 'CULTIVAR' then Efecto = 'Vg';
+    else if Comp = 'RESIDUAL' then Efecto = 'Ve';
+    /* Las otras (Vy, Vgy) no estarán presentes en este paso de Nr, 
+       pero dejarlas no hace daño si planeas reusar el código luego */
+run;
+
+/* Ordenamos incluyendo Anio porque ahora el modelo corrió por ensayo */
+proc sort data=Var_Pre_Trans; 
+    by Subregion Loc Manejo Epoca Anio; 
+run;
+
+proc transpose data=Var_Pre_Trans out=Varianzas_Anchas (drop=_NAME_ _LABEL_);
+    by Subregion Loc Manejo Epoca Anio;
+    id Efecto;
+    var Estimate;
+run;
+
+/* ==========================================================
+   PASO 4: CÁLCULO DE NR OPTIMIZADO (Nr por Localidad)
+   ========================================================== */
+/* 1. Limpieza de nulos */
+data Resultado_Nr_Local;
+    set Varianzas_Anchas;
+    /* Evitamos que los nulos rompan la fórmula */
+    Vg = coalesce(Vg, 0); Ve = coalesce(Ve, 0);
+
+/* 2. Cálculo de Heredabilidad Anual (Ha) para el umbral */
+    /* Usamos n=1 (año) para determinar la precisión por sitio */
+    denominador = Vg + Ve; 
+    if denominador > 0 then Ha = Vg / denominador;
+    else Ha = .;
+
+/* 3. Cálculo de Nr Crudo (Relación de varianzas) */
+    /* Esta es la base para tu Tabla 1 */
+    if Vg > 0 then Nr_crudo = Ve / Vg;
+    else Nr_crudo = .;
+run;
+
+/* ==========================================================
+   PASO 5: CÁLCULO DE UMBRAL (Q3) Y PROMEDIO Nr SUBREGIONAL
+   ========================================================== */
+
+/* 5.1 Determinamos el Q3 de Ha por sistema (Manejo x Epoca) */
+/* Usamos NWAY para que solo nos de el nivel máximo de combinación */
+proc sort data=Resultado_Nr_Local; by Manejo Epoca; run;
+
+proc means data=Resultado_Nr_Local noprint nway;
+    class Manejo Epoca;
+    var Ha;
+    output out=Umbral_Ha_Nr p75=Ha_Q3;
+run;
+
+/* 5.2 Calculamos el Nr_Promedio final por Subregión */
+data TABLA_NR_PRE_FINAL;
+    /* Al mergear, SAS asocia el Q3 del sistema a cada localidad/año */
+    merge Resultado_Nr_Local (in=a) Umbral_Ha_Nr (in=b);
+    by Manejo Epoca;
+    if a;
+
+    /* Multiplicador Hu basado en el Q3 de Heredabilidad */
+    if Ha_Q3 > 0 and Ha_Q3 < 1 then Hu = Ha_Q3 / (1 - Ha_Q3);
+    else Hu = 3; /* Valor por defecto si falla el cálculo */
+
+    /* Fórmula optimizada: Nr = (Hu * Ve) / Vg */
+    if Vg > 0 then do;
+        r_calc = (Hu * Ve) / Vg;
+        
+        /* Filtros de exclusión y sentido agronómico */
+        if r_calc < 1 then Nr_Limpio = 1;
+        else if r_calc > 15 then Nr_Limpio = .; /* Descartamos ensayos con error extremo */
+        else Nr_Limpio = r_calc;
+    end;
+    else Nr_Limpio = .;
+run;
+
+/* 5.3 Tabla Final de Nr (Promediando años y localidades por Subregión) */
+proc sort data=TABLA_NR_PRE_FINAL; by Subregion Manejo Epoca; run;
+
+proc means data=TABLA_NR_PRE_FINAL noprint nway;
+    class Subregion Manejo Epoca;
+    var Nr_Limpio;
+    output out=TABLA_NR_FINAL_TESIS mean=Nr_Promedio;
+run;
+
+/* Verificación visual final sin columnas técnicas */
+proc print data=TABLA_NR_FINAL_TESIS noobs;
+    var Subregion Manejo Epoca Nr_Promedio;
+    title "TABLA 1: Repeticiones Optimizadas (Nr) por Subregión";
+run;
+
+
+/* ==========================================================
+   PROTOCOLO B. OPTIMIZACIÓN DE AÑOS
+   PASO 1: PREPARACIÓN Y LIMPIEZA DE DATOS
+   ========================================================== */
+
+/* 1.1 Estandarizamos la tabla Nr que viene del Protocolo 1 */
+data Nr_Para_Na;
+    set TABLA_NR_FINAL_TESIS;
+    /* Aseguramos que los nombres y tipos coincidan con lo que saldrá del MIXED */
+    Subregion_Std = input(strip(Subregion), 32.);
+    Manejo_Std    = upcase(strip(Manejo));
+    Epoca_Std     = input(strip(Epoca), 32.);
+    drop Subregion Manejo Epoca;
+    rename Subregion_Std=Subregion Manejo_Std=Manejo Epoca_Std=Epoca;
+run;
+
+/* 1.2 Parámetros Base: calculamos cuántos años reales tiene cada sitio */
+proc sql;
+    create table Parametros_Base as
+    select Subregion, Loc, Manejo, Epoca, 
+           count(distinct Anio) as a_real
+    from (
+        select input(strip(Subregion), 32.) as Subregion, 
+               strip(Loc) as Loc, 
+               upcase(strip(Manejo)) as Manejo, 
+               input(strip(Epoca), 32.) as Epoca, 
+               Anio
+        from WORK.IMPORT
+    )
+    group by Subregion, Loc, Manejo, Epoca;
+quit;
+
+/* ==========================================================
+   PASO 2: ESTIMACIÓN DE VARIANZAS PARA Na
+   ========================================================== */
+/* Usamos la tabla DATOS_LIMP que ya ordenamos en el protocolo anterior */
+proc mixed data=DATOS_LIMP method=reml nobound;
+    by Subregion Loc Manejo Epoca;
+    class Cultivar Anio;
+    model Rto = / outpred=Residuos_Na;
+    random Cultivar Anio Cultivar*Anio;
+    ods output CovParms=Var_Salida_Na; 
+run;
+
+
+/* ==========================================================
+   PASO 3: TRANSPOSICIÓN Y UNIÓN CON NR OPTIMIZADO
+   ========================================================== */
+data Var_Limpia_Na;
+    set Var_Salida_Na;
+    length Comp_Name $10;
+    Comp = upcase(compress(CovParm));
+    if Comp = 'CULTIVAR' then Comp_Name = 'Vg';
+    else if Comp = 'ANIO' then Comp_Name = 'Vy';
+    else if index(Comp, 'CULTIVAR*ANIO') > 0 then Comp_Name = 'Vgy';
+    else if Comp = 'RESIDUAL' then Comp_Name = 'Ve';
+    
+    /* Homologamos variables de unión */
+    Subregion_Std = input(strip(Subregion), 32.);
+    Manejo_Std    = upcase(strip(Manejo));
+    Epoca_Std     = input(strip(Epoca), 32.);
+    drop Subregion Manejo Epoca;
+    rename Subregion_Std=Subregion Manejo_Std=Manejo Epoca_Std=Epoca;
+run;
+
+proc sort data=Var_Limpia_Na; by Subregion Loc Manejo Epoca; run;
+
+proc transpose data=Var_Limpia_Na out=Var_Ancha_Na (drop=_NAME_ _LABEL_);
+    by Subregion Loc Manejo Epoca;
+    id Comp_Name;
+    var Estimate;
+run;
+
+/* Unión de Varianzas, Parámetros Base y Nr Optimizado */
+proc sort data=Parametros_Base; by Subregion Loc Manejo Epoca; run;
+proc sort data=Nr_Para_Na; by Subregion Manejo Epoca; run;
+
+data Resultado_Pre_Na;
+    merge Var_Ancha_Na (in=a) Parametros_Base (in=b);
+    by Subregion Loc Manejo Epoca;
+    if a;
+run;
+
+/* 3.1 Ordenamos la tabla de varianzas por la nueva jerarquía (quitando Loc) */
+proc sort data=Resultado_Pre_Na; 
+    by Subregion Manejo Epoca; 
+run;
+
+/* 3.2 Aseguramos que la tabla de Nr también esté ordenada igual */
+proc sort data=Nr_Para_Na; 
+    by Subregion Manejo Epoca; 
+run;
+
+/* 3.3 Ahora sí, la unión final sin errores de BY */
+data Resultado_Con_Nr;
+    merge Resultado_Pre_Na (in=a) Nr_Para_Na (in=b);
+    by Subregion Manejo Epoca;
+    if a;
+
+    /* Si no hay Nr calculado para esa subregión, usamos 3 por defecto */
+    r_optimo = coalesce(Nr_Promedio, 3);
+
+    Vg = coalesce(Vg, 0); Vgy = coalesce(Vgy, 0); Ve = coalesce(Ve, 0);
+
+    /* Ha usando el r_optimo (Micro-optimización) */
+    if Vg > 0 then do;
+        /* Usamos a_real que viene de Parametros_Base */
+        denominador = Vg + (Vgy / a_real) + (Ve / (a_real * r_optimo));
+        if denominador > 0 then Ha = Vg / denominador;
+        else Ha = .;
+    end;
+    else Ha = .;
+run;
+
+/* ==========================================================
+   PASO 4: CÁLCULO DE Na Y TABLA RESUMEN PARA TESIS
+   ========================================================== */
+proc sort data=Resultado_Con_Nr; by Manejo Epoca; run;
+
+proc univariate data=Resultado_Con_Nr noprint;
+    where Ha > 0;
+    by Manejo Epoca;
+    var Ha;
+    output out=Q3_Sistemas pctlpts=75 pctlpre=Q3_Ha;
+run;
+
+data Protocolo_Final_Na;
+    merge Resultado_Con_Nr (in=a) Q3_Sistemas (in=b);
+    by Manejo Epoca;
+    if a;
+
+    if Q3_Ha75 > 0 and Q3_Ha75 < 1 then do;
+        Hu = Q3_Ha75 / (1 - Q3_Ha75);
+        if Vg > 0 then do;
+            Na_Calc = (Hu * (Vgy + (Ve / r_optimo))) / Vg;
+            
+            /* Filtros de exclusión */
+            if Na_Calc > 15 then Na_Ajustado = .; 
+            else if Na_Calc < 1 then Na_Ajustado = 1;
+            else Na_Ajustado = Na_Calc;
+            
+            /* Tope para gráficos de Tesis */
+            if Na_Ajustado > 6 then Na_Tesis = 6;
+            else Na_Tesis = Na_Ajustado;
+        end;
+    end;
+run;
+
+proc means data=Protocolo_Final_Na n mean std nmiss noprint;
+    class Subregion Manejo Epoca;
+    var Na_Ajustado Na_Tesis;
+    output out=TABLA_RESUMEN_NA_TESIS
+           mean(Na_Ajustado)=Na_Puro_Promedio
+           mean(Na_Tesis)=Na_Tesis_Promedio;
+run;
+
+/* ==========================================================
+   PASO 5: VISUALIZACIÓN DE RESULTADOS Na
+   ========================================================== */
+
+/* 1. Limpiamos la tabla resumen para ver solo las filas que importan */
+data TABLA_NA_VISTA;
+    set TABLA_RESUMEN_NA_TESIS;
+    /* _TYPE_ = 7 corresponde a la combinación completa: Subregion*Manejo*Epoca */
+    if _TYPE_ = 7; 
+run;
+
+/* 2. Mostramos los resultados en el reporte */
+proc print data=TABLA_NA_VISTA;
+    var Subregion Manejo Epoca Na_Puro_Promedio Na_Tesis_Promedio;
+    title "TABLA FINAL PROTOCOLO Na: Años Optimizados por Subregión";
+run;
+
+/* 3. AUDITORÍA DE DATOS: Usamos MEANS para ver el Na por grupo */
+proc means data=Protocolo_Final_Na n nmiss mean min max maxdec=2;
+    class Manejo Epoca;
+    var Na_Ajustado;
+    title "RESUMEN DE RESULTADOS: Na Ajustado por Manejo y Época";
+run;
+
+/* 4. Si necesitás ver la frecuencia de valores perdidos específicamente */
+proc freq data=Protocolo_Final_Na;
+    tables Manejo*Epoca / nocol nopercent nocum missing;
+    title "CONTEO DE REGISTROS POR GRUPO";
+run;
+
+
+/* ==========================================================
+   PROTOCOLO C. OPTIMIZACIÓN DE SITIOS
+   PASO 1: ESTANDARIZACIÓN Y UNIÓN DE PARÁMETROS OPTIMIZADOS
+   ========================================================== */
+
+/* 1.1 Limpiamos la tabla de Na (Años) que acabas de generar */
+data Na_Limpia_Para_Ns;
+    set TABLA_RESUMEN_NA_TESIS;
+    /* Filtramos solo las filas de promedios por Subregion-Manejo-Epoca */
+    if _TYPE_ = 7; 
+    
+    Subregion_Std = input(strip(Subregion), 32.);
+    Manejo_Std    = upcase(strip(Manejo));
+    Epoca_Std     = input(strip(Epoca), 32.);
+    
+    /* Na_Puro_Promedio es el nombre que le dimos en el protocolo Na */
+    a_opt_val = Na_Puro_Promedio; 
+    
+    drop Subregion Manejo Epoca;
+    rename Subregion_Std=Subregion Manejo_Std=Manejo Epoca_Std=Epoca a_opt_val=a_opt;
+run;
+
+/* 1.2 Limpiamos la tabla de Nr (Repeticiones) */
+data Nr_Limpia_Para_Ns;
+    set TABLA_NR_FINAL_TESIS;
+    Subregion_Std = input(strip(Subregion), 32.);
+    Manejo_Std    = upcase(strip(Manejo));
+    Epoca_Std     = input(strip(Epoca), 32.);
+    
+    r_opt_val = Nr_Promedio;
+    
+    drop Subregion Manejo Epoca;
+    rename Subregion_Std=Subregion Manejo_Std=Manejo Epoca_Std=Epoca r_opt_val=r_opt;
+run;
+
+/* 1.3 Unión de parámetros mediante SQL */
+proc sql;
+    create table Params_Optimos as
+    select a.Subregion, a.Manejo, a.Epoca, a.r_opt, b.a_opt
+    from Nr_Limpia_Para_Ns a
+    left join Na_Limpia_Para_Ns b
+      on a.Subregion=b.Subregion and a.Manejo=b.Manejo and a.Epoca=b.Epoca;
+quit;
+
+/* ==========================================================
+   PASO 2 Y 3: ESTIMACIÓN Y TRANSPOSICIÓN (Igual a tu código)
+   ========================================================== */
+proc sort data=WORK.IMPORT; by Subregion Manejo Epoca Anio; run;
+
+proc mixed data=WORK.IMPORT method=reml nobound;  
+    class Loc Cultivar; 
+    model Rto = ;   
+    random Loc Cultivar Cultivar*Loc;   
+    by Subregion Manejo Epoca Anio;   
+    ods output CovParms=Var_Salida_Ns; 
+run;
+
+data Var_Limpia_Ns;
+    set Var_Salida_Ns;
+    length Efecto $10;
+    Comp = upcase(compress(CovParm));
+    if Comp = 'LOC' then Efecto = 'Vl';
+    else if Comp = 'CULTIVAR' then Efecto = 'Vg';
+    else if index(Comp, 'CULTIVAR*LOC') > 0 or index(Comp, 'LOC*CULTIVAR') > 0 then Efecto = 'Vgl';
+    else if Comp = 'RESIDUAL' then Efecto = 'Ve';
+    
+    Subregion_Std = input(strip(Subregion), 32.);
+    Manejo_Std    = upcase(strip(Manejo));
+    Epoca_Std     = input(strip(Epoca), 32.);
+    drop Subregion Manejo Epoca;
+    rename Subregion_Std=Subregion Manejo_Std=Manejo Epoca_Std=Epoca;
+run;
+
+proc sort data=Var_Limpia_Ns; by Subregion Manejo Epoca Anio; run;
+
+proc transpose data=Var_Limpia_Ns out=Var_Plana_Ns(drop=_NAME_ _LABEL_);
+    by Subregion Manejo Epoca Anio;
+    id Efecto;
+    var Estimate;
+run;
+
+/* ==========================================================
+   PASO 4 Y 5: CÁLCULO FINAL Ns
+   ========================================================== */
+data PLANILLA_PRE_NS;
+    merge Var_Plana_Ns(in=a) Params_Optimos(in=b);
+    by Subregion Manejo Epoca;
+    if a;
+
+    Vg = coalesce(Vg, 0); Vgl = coalesce(Vgl, 0); Ve = coalesce(Ve, 0);
+    r_opt = coalesce(r_opt, 3);
+    a_opt = coalesce(a_opt, 3);
+
+    denominador_h = Vg + Vgl + (Ve / r_opt);
+    if denominador_h > 0 then H_anual = Vg / denominador_h;
+    else H_anual = .;
+run;
+
+proc sort data=PLANILLA_PRE_NS; by Manejo Epoca; run;
+proc means data=PLANILLA_PRE_NS noprint;
+    class Manejo Epoca;
+    var H_anual;
+    output out=H_Umbral_Ns p75=H_Q3; 
+run;
+
+data TABLA_NS_FINAL_TESIS;
+    merge PLANILLA_PRE_NS(in=a) H_Umbral_Ns(in=b where=(_TYPE_=3));
+    by Manejo Epoca;
+    if a;
+
+    if H_Q3 > 0 and H_Q3 < 1 then Multiplicador = H_Q3 / (1 - H_Q3);
+    else Multiplicador = 3;
+
+    if Vg > 0 then do;
+        Ns_crudo = Multiplicador * ( (Vgl + (Ve / (a_opt * r_opt))) / Vg );
+        
+        if Ns_crudo < 1 then Ns_filtrado = 1;
+        else if Ns_crudo > 15 then Ns_filtrado = .; 
+        else Ns_filtrado = Ns_crudo;
+    end;
+run;
+
+proc means data=TABLA_NS_FINAL_TESIS n mean std min max nmiss;
+    class Subregion Manejo Epoca;
+    var Ns_filtrado;
+    title "OPTIMIZACIÓN FINAL: Número de Localidades (Ns) con r y a Optimizados";
+run;
